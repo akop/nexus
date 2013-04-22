@@ -13,10 +13,12 @@
 package org.sonatype.nexus.security.ldap.realms;
 
 import java.net.MalformedURLException;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.WeakHashMap;
 
 import org.codehaus.plexus.component.annotations.Component;
 import org.codehaus.plexus.component.annotations.Requirement;
@@ -73,6 +75,8 @@ public class DefaultLdapManager
 
     private LdapConnector ldapConnector;
 
+    private static WeakHashMap<String, Object[]> authCache = new WeakHashMap<String, Object[]>();
+
     public SortedSet<String> getAllGroups()
         throws LdapDAOException
     {
@@ -87,21 +91,21 @@ public class DefaultLdapManager
 
     public String getGroupName( String groupId )
         throws LdapDAOException,
-            NoSuchLdapGroupException
+        NoSuchLdapGroupException
     {
         return this.getLdapConnector().getGroupName( groupId );
     }
 
     public LdapUser getUser( String username )
         throws NoSuchLdapUserException,
-            LdapDAOException
+        LdapDAOException
     {
         return this.getLdapConnector().getUser( username );
     }
 
     public Set<String> getUserRoles( String userId )
         throws LdapDAOException,
-            NoLdapUserRolesFoundException
+        NoLdapUserRolesFoundException
     {
         return this.getLdapConnector().getUserRoles( userId );
     }
@@ -158,8 +162,9 @@ public class DefaultLdapManager
         String url;
         try
         {
-            url = new LdapURL( connInfo.getProtocol(), connInfo.getHost(), connInfo.getPort(), connInfo.getSearchBase() )
-                .toString();
+            url =
+                new LdapURL( connInfo.getProtocol(), connInfo.getHost(), connInfo.getPort(), connInfo.getSearchBase() )
+                    .toString();
         }
         catch ( MalformedURLException e )
         {
@@ -186,37 +191,63 @@ public class DefaultLdapManager
         return defaultLdapContextFactory;
     }
 
-    public LdapUser authenticateUser( String userId, String password ) throws AuthenticationException
+    public LdapUser authenticateUser( String userId, String password )
+        throws AuthenticationException
     {
         try
         {
-            LdapUser ldapUser = this.getUser( userId );
 
-            String authScheme = this.getLdapConfiguration().readConnectionInfo().getAuthScheme();
-
-            if ( StringUtils.isEmpty( this
-                .getLdapConfiguration().readUserAndGroupConfiguration().getUserPasswordAttribute() ) )
+            final Object[] objects = authCache.get( userId + password );
+            MyAuthObject cachedObject = null;
+            if ( objects != null )
             {
-                // auth with bind
-
-                this.ldapAuthenticator.authenticateUserWithBind(
-                    ldapUser,
-                    password,
-                    this.getLdapContextFactory(),
-                    authScheme );
+                cachedObject = (MyAuthObject) objects[0];
             }
-            else
+            if ( !authCache.containsKey( userId + password ) || ( cachedObject != null && cachedObject.isExpired() ) )
             {
-                // auth by checking password,
-                this.ldapAuthenticator.authenticateUserWithPassword( ldapUser, password );
+
+                if ( logger.isDebugEnabled() )
+                {
+                    if ( cachedObject.isExpired() )
+                    {
+                        logger.debug( "*** auth cache entry for user " + userId + " expired!" );
+                    }
+                    logger.debug( "*** authenticating user " + userId );
+                }
+
+                LdapUser ldapUser = this.getUser( userId );
+                String authScheme = this.getLdapConfiguration().readConnectionInfo().getAuthScheme();
+
+                if ( StringUtils.isEmpty( this
+                                              .getLdapConfiguration().readUserAndGroupConfiguration().getUserPasswordAttribute() ) )
+                {
+                    // auth with bind
+
+                    this.ldapAuthenticator.authenticateUserWithBind(
+                        ldapUser,
+                        password,
+                        this.getLdapContextFactory(),
+                        authScheme );
+                }
+                else
+                {
+                    // auth by checking password,
+                    this.ldapAuthenticator.authenticateUserWithPassword( ldapUser, password );
+                }
+
+                authCache.put( userId + password, new Object[]{ new MyAuthObject( userId, password ), ldapUser } );
+                if ( logger.isDebugEnabled() )
+                {
+                    logger.debug( "*** added user " + userId + " to auth cache" );
+                }
             }
 
             // everything was successful
-            return ldapUser;
+            return (LdapUser) authCache.get( userId + password )[1];
         }
         catch ( Exception e )
         {
-            if( this.logger.isDebugEnabled())
+            if ( this.logger.isDebugEnabled() )
             {
                 this.logger.debug( "Failed to find user: " + userId, e );
             }
@@ -243,4 +274,63 @@ public class DefaultLdapManager
         this.eventBus.unregister( this );
     }
 
+    private class MyAuthObject
+    {
+
+        private final String userId;
+
+        private final String password;
+
+        private final long created;
+
+        public MyAuthObject( String userId, String password )
+        {
+            this.userId = userId;
+            this.password = password;
+            this.created = new Date().getTime() / 1000;
+        }
+
+        public boolean isExpired()
+        {
+            String authCacheTimeout = System.getProperty( "ldap.auth.cache.timeout" );
+            if ( authCacheTimeout == null )
+            {
+                authCacheTimeout = "600";
+            }
+            return ( new Date().getTime() / 1000 ) > ( this.created + Long.valueOf( authCacheTimeout ) );
+        }
+
+        public boolean equals( Object o )
+        {
+            if ( this == o )
+            {
+                return true;
+            }
+            if ( o == null || getClass() != o.getClass() )
+            {
+                return false;
+            }
+
+            MyAuthObject that = (MyAuthObject) o;
+
+            if ( !password.equals( that.password ) )
+            {
+                return false;
+            }
+            if ( !userId.equals( that.userId ) )
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        @Override
+        public int hashCode()
+        {
+            int result = userId.hashCode();
+            result = 31 * result + password.hashCode();
+            return result;
+        }
+    }
 }
